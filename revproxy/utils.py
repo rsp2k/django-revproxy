@@ -246,7 +246,7 @@ def cookie_from_string(cookie_string, strict_cookies=False):
                 elif attr == 'max-age':
                     # The cookie uses 'max-age' but django's
                     # set_cookie uses 'max_age'
-                    cookie_dict['max_age'] = unquote(value)
+                    cookie_dict['max_age'] = int(unquote(value))
                 else:
                     cookie_dict[attr] = unquote(value)
             else:
