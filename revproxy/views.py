@@ -150,7 +150,7 @@ class ProxyView(View):
         if (self.add_remote_user and hasattr(self.request, 'user')
                 and self.request.user.is_active):
             request_headers['REMOTE_USER'] = self.request.user.get_email()
-            self.log.info("REMOTE_USER set")
+            self.log.info(f"REMOTE_USER set to {request_headers['REMOTE_USER']}")
 
         if self.add_x_forwarded:
             request_ip = self.request.META.get('REMOTE_ADDR')
