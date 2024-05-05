@@ -26,16 +26,16 @@ def get_django_response(
     :returns: Returns an appropriate response based on the proxy_response
               content-length
     """
-    status = proxy_response.status
+    status = proxy_response.status_code
     headers = proxy_response.headers
 
     logger.debug('Proxy response headers: %s', headers)
 
-    content_type = headers.get('Content-Type')
+    content_type = headers.get('content-type', 'application/octet-stream')
 
-    logger.debug('Content-Type: %s', content_type)
+    logger.debug('Content-Type: %s', content_type, )
 
-    if should_stream(proxy_response):
+    if should_stream(proxy_response) and False:
         if streaming_amount is None:
             amt = get_streaming_amt(proxy_response)
         else:
@@ -47,21 +47,26 @@ def get_django_response(
                                          status=status,
                                          content_type=content_type)
     else:
-        content = proxy_response.data or b''
-        response = HttpResponse(content, status=status,
-                                content_type=content_type)
+        response = HttpResponse(proxy_response, status=status)
 
     logger.info('Normalizing response headers')
     set_response_headers(response, headers)
 
-    cookies = proxy_response.headers.getlist('set-cookie')
     logger.info('Checking for invalid cookies')
-    for cookie_string in cookies:
-        cookie_dict = cookie_from_string(cookie_string,
-                                         strict_cookies=strict_cookies)
-        # if cookie is invalid cookie_dict will be None
-        if cookie_dict:
-            response.set_cookie(**cookie_dict)
+    for cookie in proxy_response.cookies:
+
+        httponly = cookie.has_nonstandard_attr('httponly')
+        response.set_cookie(
+            cookie.name,
+            value=cookie.value,
+            path=cookie.path,
+            domain=cookie.domain,
+            secure=cookie.secure,
+            expires=cookie.expires,
+            httponly=httponly,
+            #            samesite=cookie.samesite,
+#            max_age=cookie.max_age,
+        )
 
     logger.debug('Response cookies: %s', response.cookies)
 

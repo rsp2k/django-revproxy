@@ -72,7 +72,7 @@ def should_stream(proxy_response):
     :returns: A boolean stating if the proxy_response should
               be treated as a stream
     """
-    content_type = proxy_response.headers.get('Content-Type')
+    content_type = proxy_response.headers.get('content-type', 'application/octet-stream')
 
     if is_html_content_type(content_type):
         return False

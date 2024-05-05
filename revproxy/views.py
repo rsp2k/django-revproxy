@@ -1,12 +1,14 @@
-# -*- coding: utf-8 -*-
-
-import os
+import hashlib
 import re
-import sys
-import mimetypes
 import logging
+import time
 
-import urllib3
+import requests
+from django.http import HttpResponseServerError
+from django.utils import timezone
+from django.utils.functional import cached_property
+
+from revproxy.models import CachedResponse
 
 try:
     from django.utils.six.moves.urllib.parse import (
@@ -18,25 +20,17 @@ except ImportError:
 from django.shortcuts import redirect
 from django.views.generic import View
 from django.utils.decorators import classonlymethod
-from django.views.generic.base import ContextMixin
 
 from .exceptions import InvalidUpstream
 from .response import get_django_response
-from .transformer import DiazoTransformer
-from .utils import normalize_request_headers, encode_items
+from .utils import normalize_request_headers
 
-# Chars that don't need to be quoted. We use same than nginx:
-#   https://github.com/nginx/nginx/blob/nginx-1.9/src/core/ngx_string.c
-#   (Lines 1433-1449)
-QUOTE_SAFE = r'<.;>\(}*+|~=-$/_:^@)[{]&\'!,"`'
-
+logger = logging.getLogger()
 
 ERRORS_MESSAGES = {
     'upstream-no-scheme': ("Upstream URL scheme must be either "
                            "'http' or 'https' (%s).")
 }
-
-HTTP_POOLS = urllib3.PoolManager()
 
 
 class ProxyView(View):
@@ -46,12 +40,17 @@ class ProxyView(View):
     """
     _upstream = None
 
+    # Store request and server response in the database
+    store_in_db = False
+
+    # List of strings to consider in request hash for caching
+    headers_to_hash = []
+
     add_x_forwarded = False
     add_remote_user = False
-    default_content_type = 'application/octet-stream'
-    retries = None
-    rewrite = tuple()  # It will be overrided by a tuple inside tuple.
+
     strict_cookies = False
+
     #: Do not send any body if it is empty (put ``None`` into the ``urlopen()``
     #: call).  This is required when proxying to Shiny apps, for example.
     suppress_empty_body = False
@@ -62,16 +61,18 @@ class ProxyView(View):
     streaming_amount = None
 
     def __init__(self, *args, **kwargs):
-        super(ProxyView, self).__init__(*args, **kwargs)
+        self.store_in_db = kwargs.pop('store_in_db', False)
+        self.cache_responses = kwargs.pop('cache_responses', False)
+        self.headers_to_hash = kwargs.pop('headers_to_hash', [])
+        self.rewrite = kwargs.pop('rewrite', [])
+
+        super().__init__(*args, **kwargs)
 
         self._rewrite = []
         # Take all elements inside tuple, and insert into _rewrite
         for from_pattern, to_pattern in self.rewrite:
             from_re = re.compile(from_pattern)
             self._rewrite.append((from_re, to_pattern))
-        self.http = HTTP_POOLS
-        self.log = logging.getLogger('revproxy.view')
-        self.log.info("ProxyView created")
 
     @property
     def upstream(self):
@@ -93,7 +94,7 @@ class ProxyView(View):
             raise InvalidUpstream(ERRORS_MESSAGES['upstream-no-scheme'] %
                                   upstream)
 
-        if path and upstream[-1] != '/':
+        if path and not upstream.endswith('/'):
             upstream += '/'
 
         return upstream
@@ -106,11 +107,11 @@ class ProxyView(View):
 
     def _format_path_to_redirect(self, request):
         full_path = request.get_full_path()
-        self.log.debug("Dispatch full path: %s", full_path)
+        logger.debug("Dispatch full path: %s", full_path)
         for from_re, to_pattern in self._rewrite:
             if from_re.match(full_path):
                 redirect_to = from_re.sub(to_pattern, full_path)
-                self.log.debug("Redirect to: %s", redirect_to)
+                logger.debug("Redirect to: %s", redirect_to)
                 return redirect_to
 
     def get_proxy_request_headers(self, request):
@@ -128,7 +129,8 @@ class ProxyView(View):
         """
         return normalize_request_headers(request)
 
-    def get_request_headers(self):
+    @cached_property
+    def request_headers(self):
         """Return request headers that will be sent to upstream.
 
         The header REMOTE_USER is set to the current user
@@ -150,58 +152,62 @@ class ProxyView(View):
         if (self.add_remote_user and hasattr(self.request, 'user')
                 and self.request.user.is_active):
             request_headers['REMOTE_USER'] = self.request.user.email
-            self.log.info(f"REMOTE_USER set to {request_headers['REMOTE_USER']}")
+            logger.info(f"REMOTE_USER set to {request_headers['REMOTE_USER']}")
 
         if self.add_x_forwarded:
             request_ip = self.request.META.get('REMOTE_ADDR')
-            self.log.debug("Proxy request IP: %s", request_ip)
+            logger.debug("Proxy request IP: %s", request_ip)
             request_headers['X-Forwarded-For'] = request_ip
 
             request_proto = "https" if self.request.is_secure() else "http"
-            self.log.debug("Proxy request using %s", request_proto)
+            logger.debug("Proxy request using %s", request_proto)
             request_headers['X-Forwarded-Proto'] = request_proto
 
         return request_headers
 
-    def get_quoted_path(self, path):
-        """Return quoted path to be used in proxied request"""
-        return quote_plus(path.encode('utf8'), QUOTE_SAFE)
-
-    def get_encoded_query_params(self):
-        """Return encoded query params to be used in proxied request"""
-        get_data = encode_items(self.request.GET.lists())
-        return urlencode(get_data)
-
-    def _created_proxy_response(self, request, path):
+    def fetch_from_proxy(self, request, path):
         request_payload = request.body
         if self.suppress_empty_body and not request_payload:
             request_payload = None
 
-        self.log.debug("Request headers: %s", self.request_headers)
+        logger.debug("Request headers: {self.request_headers}")
 
-        path = self.get_quoted_path(path)
+        fetch = getattr(requests, request.method.lower())
 
-        request_url = self.get_upstream(path) + path
-        self.log.debug("Request URL: %s", request_url)
+        request_url = f"{self.get_upstream(path)}" + path
 
-        if request.GET:
-            request_url += '?' + self.get_encoded_query_params()
-            self.log.debug("Request URL: %s", request_url)
-
+        logger.debug(f"Using {fetch} to get {request_url}")
         try:
-            proxy_response = self.http.urlopen(request.method,
-                                               request_url,
-                                               redirect=False,
-                                               retries=self.retries,
-                                               headers=self.request_headers,
-                                               body=request_payload,
-                                               decode_content=False,
-                                               preload_content=False)
-            self.log.debug("Proxy response header: %s",
-                           proxy_response.getheaders())
-        except urllib3.exceptions.HTTPError as error:
-            self.log.exception(error)
-            raise
+            proxy_response = fetch(
+                request_url,
+                params=self.request.GET,
+                allow_redirects=False,
+                headers=self.request_headers,
+                data=request_payload,
+            )
+        except requests.exceptions.SSLError as error:
+            logger.exception(error)
+            return HttpResponseServerError(
+                "The server has a security problem!"
+            )
+
+        except (
+                requests.exceptions.Timeout,
+                requests.exceptions.ConnectionError
+        ) as error:
+            logger.exception(error)
+            return HttpResponseServerError(
+                "Something went wrong connecting to the server"
+            )
+
+        except requests.exceptions.RequestException as error:
+            logger.exception(error)
+            return HttpResponseServerError(
+                "Unknown error!"
+            )
+
+        logger.debug("Proxy response header: %s",
+                     proxy_response.headers)
 
         return proxy_response
 
@@ -214,70 +220,99 @@ class ProxyView(View):
                 scheme = 'http://'
             request_host = scheme + request.get_host()
 
-            upstream_host_http = 'http://' + self._parsed_url.netloc
             upstream_host_https = 'https://' + self._parsed_url.netloc
 
-            location = location.replace(upstream_host_http, request_host)
             location = location.replace(upstream_host_https, request_host)
             proxy_response.headers['Location'] = location
-            self.log.debug("Proxy response LOCATION: %s",
+            logger.debug("Proxy response LOCATION: %s",
                            proxy_response.headers['Location'])
 
-    def _set_content_type(self, request, proxy_response):
-        content_type = proxy_response.headers.get('Content-Type')
-        if not content_type:
-            content_type = (mimetypes.guess_type(request.path)[0] or
-                            self.default_content_type)
-            proxy_response.headers['Content-Type'] = content_type
-            self.log.debug("Proxy response CONTENT-TYPE: %s",
-                           proxy_response.headers['Content-Type'])
-
-    def dispatch(self, request, path):
-        self.request_headers = self.get_request_headers()
-
+    def dispatch(self, request, *args, **kwargs):
+        path = kwargs.get('path')
         redirect_to = self._format_path_to_redirect(request)
         if redirect_to:
             return redirect(redirect_to)
 
-        proxy_response = self._created_proxy_response(request, path)
+        request_ip = self.request.META.get(
+            'X-Forwarded-For',
+            self.request.META.get('REMOTE_ADDR', None)
+        )
 
+        if self.store_in_db:
+            extra_salt = None
+            if self.cache_responses == 'per_ip':
+                extra_salt = request_ip
+
+            request_hash = self.get_request_hash(extra_salt=extra_salt)
+
+            try:
+                proxy_response_object = CachedResponse.objects.get(
+                    request_md5=request_hash
+                )
+                logger.debug("💸 CACHE HIT!!")
+                proxy_response = proxy_response_object.response
+
+            except CachedResponse.DoesNotExist:
+                logger.debug("🍟 CACHE MISS!")
+                started = timezone.now()
+                proxy_response = self.fetch_from_proxy(request, path)
+                response_time = timezone.now() - started
+                try:
+                    proxy_response_object = CachedResponse.objects.create(
+                        request_md5=request_hash,
+                        request_ip=request_ip,
+                        request=self.request,
+                        response=proxy_response,
+                        response_time=response_time,
+                    )
+
+                except Exception as e:
+                    logger.exception(e)
+                    pass
+
+            else:
+                proxy_response = self.fetch_from_proxy(request, path)
+        else:
+            proxy_response = self.fetch_from_proxy(request, path)
+
+        response = self.modified_proxy_response(request, proxy_response)
+
+        logger.debug("RESPONSE RETURNED: %s", response)
+
+        return response
+
+    def modified_proxy_response(self, request, proxy_response):
         self._replace_host_on_redirect_location(request, proxy_response)
-        self._set_content_type(request, proxy_response)
 
         response = get_django_response(proxy_response,
                                        strict_cookies=self.strict_cookies,
                                        streaming_amount=self.streaming_amount)
 
-        self.log.debug("RESPONSE RETURNED: %s", response)
         return response
 
+    def get_request_hash(self, extra_salt=''):
+        if self.request.method == 'POST':
+            return None
 
-class DiazoProxyView(ProxyView, ContextMixin):
-    _diazo_rules = None
-    diazo_theme_template = 'diazo.html'
-    html5 = False
+        body_hash = ""
+        if self.request.body:
+            body_hash = hashlib.md5(self.request.body.body).hexdigest()
 
-    @property
-    def diazo_rules(self):
-        if not self._diazo_rules:
-            child_class_file = sys.modules[self.__module__].__file__
-            app_path = os.path.abspath(os.path.dirname(child_class_file))
-            diazo_path = os.path.join(app_path, 'diazo.xml')
+        if not extra_salt:
+            extra_salt = 'revproxy'
 
-            self.log.debug("diazo_rules: %s", diazo_path)
-            self._diazo_rules = diazo_path
-        return self._diazo_rules
+        query_string = self.request.META.get('QUERY_STRING', "")
+        data_to_hash = [
+            extra_salt,
+            self.request.path,
+            query_string,
+            body_hash,
+        ]
 
-    @diazo_rules.setter
-    def diazo_rules(self, value):
-        self._diazo_rules = value
+        # only consider headers in self.headers_to_hash
+        for h, k in self.request.headers.items():
+            if h in self.headers_to_hash:
+                data_to_hash.append(f"{h}:{k}")
 
-    def dispatch(self, request, path):
-        response = super(DiazoProxyView, self).dispatch(request, path)
-
-        context_data = self.get_context_data()
-        diazo = DiazoTransformer(request, response)
-        response = diazo.transform(self.diazo_rules, self.diazo_theme_template,
-                                   self.html5, context_data)
-
-        return response
+        d = ''.join(data_to_hash)
+        return hashlib.md5(d.encode()).hexdigest()
