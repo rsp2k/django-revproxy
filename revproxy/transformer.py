@@ -71,8 +71,7 @@ class DiazoTransformer(object):
         if hasattr(self.request, 'is_ajax'):
             return self.request.is_ajax()
         else:
-            return self.request.headers.get('x-requested-with') \
-                   == 'XMLHttpRequest'
+            return self.request.headers.get('x-requested-with') == 'XMLHttpRequest'
 
     def should_transform(self):
         """Determine if we should transform the response
