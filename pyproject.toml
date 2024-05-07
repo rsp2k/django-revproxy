@@ -44,6 +44,7 @@ dependencies = [
     "Django>=3.0",
     "urllib3>=1.12",
     "requests",
+    "responses",
     "django-ipware",
 ]
 optional-dependencies.diazo = [

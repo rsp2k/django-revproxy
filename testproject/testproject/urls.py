@@ -14,15 +14,25 @@ Including another URLconf
     1. Import the include() function: from django.urls import include, path
     2. Add a URL to urlpatterns:  path('blog/', include('blog.urls'))
 """
+from django.conf import settings
+from django.conf.urls.static import static
 from django.contrib import admin
 from django.urls import path, re_path
 
 from revproxy.views import ProxyView
+from revproxy.middleware import short_circuit_middleware
 
 urlpatterns = [
     path("admin/", admin.site.urls),
-    re_path(r"(?P<path>.*)$", ProxyView.as_view(
-        upstream="https://demostar.io/",
-        db_cache=True,
-    )),
+    re_path(r"(?P<path>.*)$",
+        short_circuit_middleware(
+            ProxyView.as_view(
+                upstream="https://demostar.io/",
+                db_cache=True,
+            )
+        )
+    ),
 ]
+
+if settings.DEBUG:
+    urlpatterns = static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT) + urlpatterns

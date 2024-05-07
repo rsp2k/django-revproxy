@@ -26,7 +26,6 @@ def get_django_response(proxy_response):
     :returns: Returns an appropriate response based on the proxy_response
               content-length
     """
-    status = proxy_response.status_code
     content_type = proxy_response.headers.get('Content-Type')
 
     if should_stream(proxy_response):
@@ -34,26 +33,29 @@ def get_django_response(proxy_response):
 
         logger.info(('Starting streaming HTTP Response, buffering amount='
                      '"%s bytes"'), amt)
+
+        logger.debug(proxy_response)
+        logger.debug(proxy_response.iter_content)
         response = StreamingHttpResponse(
-            streaming_content=proxy_response.iter_content(chunk_size=amt),
-            status=status,
+            streaming_content=proxy_response.iter_content(amt),
+            status=proxy_response.status_code,
             content_type=content_type,
         )
     else:
         response = HttpResponse(
             content=proxy_response.content,
-            status=status,
+            status=proxy_response.status_code,
             content_type=content_type,
         )
 
-    logger.debug(f'☢️{response = } \n {proxy_response.headers = }')
+    logger.debug(f'☢️{response = }\n {proxy_response.headers = }')
 
     logger.info('Normalizing response headers')
     for header, value in proxy_response.headers.items():
         if not (is_hop_by_hop(header) or header.lower() == 'set-cookie'):
             response.headers[header] = value
 
-    logger.debug(f"Response Headers: {pp.pformat(response.headers)}")
+    logger.debug(f"!Response Headers: {pp.pformat(response.headers, indent=2)}")
 
     logger.info('🫙 Cookies')
     for cookie in proxy_response.cookies:

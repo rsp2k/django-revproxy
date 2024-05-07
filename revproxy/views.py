@@ -1,11 +1,17 @@
 import hashlib
+import itertools
+import json
 import mimetypes
 import os
 import re
 import logging
 
+import pprint as pp
+from typing import LiteralString, Never
+
 import requests
-from django.http import HttpResponseServerError
+from django.conf import settings
+from django.http import HttpResponseServerError, HttpResponsePermanentRedirect, HttpResponseRedirect
 from django.utils import timezone
 from django.utils.functional import cached_property
 
@@ -38,6 +44,8 @@ ERRORS_MESSAGES = {
 }
 
 
+
+
 class ProxyView(View):
     """
     View responsible by execute proxy requests, process and return
@@ -64,35 +72,34 @@ class ProxyView(View):
     request = None
 
     def __init__(self, *args, **kwargs):
-#        self.rewrite = kwargs.pop('rewrite', [])
-#        self.db_cache = kwargs.pop('db_cache', False)
-#        self.cache_responses = kwargs.pop('cache_responses', False)
-#        self.headers_to_hash = kwargs.pop('headers_to_hash', [])
 
         super().__init__(*args, **kwargs)
+        self._compile_rewrite()
 
+    def _compile_rewrite(self) -> Never:
         if hasattr(self, 'rewrite'):
             # Take all elements inside tuple, and insert into _rewrite
             for from_pattern, to_pattern in self.rewrite:
                 from_re = re.compile(from_pattern)
                 self._rewrite_compiled.append((from_re, to_pattern))
 
-    @property
-    def request_ip(self):
+    @cached_property
+    def request_ip(self) -> str:
         ip, routable = get_client_ip(self.request)
         return ip
 
     @property
-    def upstream(self):
+    def upstream(self) -> str:
         if not self._upstream:
-            raise NotImplementedError('Upstream server must be set')
+            raise NotImplementedError(f'Upstream server must be set in {self.__class__.__name__} call in urls.py')
         return self._upstream
 
     @upstream.setter
     def upstream(self, value):
         self._upstream = value
 
-    def get_upstream(self):
+    @cached_property
+    def get_upstream(self) -> LiteralString | str | bytes:
         upstream = self.upstream
 
         if not getattr(self, '_parsed_url', None):
@@ -109,16 +116,15 @@ class ProxyView(View):
 
         return fetchpath
 
-    def _format_path_to_redirect(self):
+    def check_path_for_rewrite(self) -> None | str:
         full_path = self.request.get_full_path()
         for from_re, to_pattern in self._rewrite_compiled:
             if from_re.match(full_path):
                 redirect_to = from_re.sub(to_pattern, full_path)
-                return redirect_to
         return None
 
     @cached_property
-    def upstream_request_headers(self):
+    def upstream_request_headers(self) -> {str: str}:
         """Return request headers that will be sent to upstream.
 
         The header REMOTE_USER is set to the current user
@@ -162,15 +168,15 @@ class ProxyView(View):
 
         return headers
 
-    def fetch_from_proxy(self):
-        request_url = self.get_upstream()
+    def fetch_from_upstream(self) -> requests.Response:
+        request_url = self.get_upstream
 
         request_payload = self.request.body
         if self.suppress_empty_body and not request_payload:
             logger.debug("Suppressing empty body!")
             request_payload = None
 
-        logger.debug(f"Request headers: {self.upstream_request_headers}")
+        logger.debug(f"Request headers: {pp.pformat(self.upstream_request_headers, indent=2)}")
 
         fetch = getattr(requests, self.request.method.lower())
         logger.debug(f"Using {fetch} to get {request_url}")
@@ -181,33 +187,169 @@ class ProxyView(View):
             except ImportError:
                 # Python 2
                 import httplib as http_client
+            logger.critical("REVPROXY_DEBUG_HTTP is set. enabling http_client HTTPConnection DEBUG!")
             http_client.HTTPConnection.debuglevel = 1
 
+        proxy_response = fetch(
+            url=request_url,
+            params=self.request.GET,
+            allow_redirects=False,
+            headers=self.upstream_request_headers,
+            data=request_payload,
+        )
+
+        content_type = None
+        if 'Content-Type' not in proxy_response.headers:
+            filename = os.path.basename(self.request.path)
+            if len(filename) > 3:
+                logger.debug(f"Guessing mimetime from {filename}")
+                content_type, encoding = mimetypes.guess_type(
+                    filename
+                )
+            if not content_type:
+                logger.debug(f"No MIME type found for {filename}, defaulting to {revproxy_app_settings.DEFAULT_CONTENT_TYPE}")
+                content_type = revproxy_app_settings.DEFAULT_CONTENT_TYPE
+            else:
+                logger.debug(f"Guessed content type of {content_type}")
+
+            proxy_response.headers['Content-Type'] = content_type
+
+        return proxy_response
+
+    def _replace_host_on_redirect_location(self, proxy_response):
+        logger.debug(proxy_response.headers)
+        location = proxy_response.headers.get('Location')
+        if location:
+            if self.request.is_secure():
+                scheme = 'https://'
+            else:
+                scheme = 'http://'
+            request_host = scheme + self.request.get_host()
+
+            upstream_host_https = 'https://' + self._parsed_url.netloc
+
+            location = location.replace(upstream_host_https, request_host)
+            proxy_response.headers['Location'] = location
+            logger.debug("Proxy response LOCATION: %s",
+                           proxy_response.headers['Location'])
+        return proxy_response
+
+    def get_request_hash(self, extra_salt='') -> str | None:
+        if self.request.method == 'POST':
+            return None
+
+        body_hash = "-"
+        if self.request.body:
+            body_hash = hashlib.md5(self.request.body).hexdigest()
+
+        if not extra_salt:
+            extra_salt = 'revproxy'
+
+        query_string = self.request.META.get('QUERY_STRING')
+        if not query_string:
+            query_string = "no-query-string"
+
+        data_to_hash = [
+            self.request.method,
+            extra_salt,
+            self.request.path,
+            query_string,
+            body_hash,
+        ]
+
+        logger.debug(f"Request Data to hash: {pp.pformat(data_to_hash)}")
+
+        # only consider headers in self.headers_to_hash
+        for header_name in self.headers_to_hash:
+            if header_name in self.request.headers:
+                data_to_hash.append(f"{header_name}:{self.request.headers[header_name]}")
+        else:
+            logger.debug(f"Not adding any headers to request hash because {self.__class__.__name__}.headers_to_hash is empty")
+
+        d = ''.join(data_to_hash)
+        request_hash = hashlib.md5(d.encode()).hexdigest()
+        logger.debug(f"Request hash is {request_hash}")
+        return request_hash
+
+
+
+    def db_cache_proxy_response(self) -> requests.Response:
+        extra_salt = None
+        #            if self.cache_responses == 'per_ip':
+        #                extra_salt = self.request_ip
+        from revproxy.models import response_data_directory_path
+        request_hash = self.get_request_hash(extra_salt=extra_salt)
+        response_dir = os.path.join(
+            settings.MEDIA_ROOT, response_data_directory_path(request_hash)
+        )
+        r = requests.Response()
+        if os.path.isdir(response_dir):
+            logger.debug(f"💸 CACHE HIT!! {response_dir}")
+
+            body_file = os.path.join(response_dir, "body")
+            if os.path.isfile(body_file):
+                r.raw = open(os.path.join(response_dir, "body"), "rb")
+
+            request_file = os.path.join(response_dir, "request")
+            if os.path.isfile(request_file):
+                with open(request_file, "r") as f:
+                    json_data = f.read()
+                # Update utime for
+                os.utime(request_file, None)
+
+            request = json.loads(json_data)
+            r.headers = request["headers"]
+            r.status_code = request["status_code"]
+            r.content_type = request["content_type"]
+
+            return r
+
+        else:
+            logger.debug("🍟 CACHE MISS!")
+
+            started = timezone.now()
+            upstream_response = self.fetch_from_upstream()
+            response_time = timezone.now() - started
+
+            os.makedirs(response_dir)
+
+            with open(os.path.join(response_dir, "body"), "wb") as f:
+                file_iterator, response_iterator = itertools.tee(upstream_response.iter_content())
+                f.writelines(file_iterator)
+
+            with open(os.path.join(response_dir, "request"), "wb") as f:
+                json_data = json.dumps({
+                    "headers": dict(upstream_response.headers),
+                    "status_code": upstream_response.status_code,
+                    "content_type": upstream_response.headers.get("Content-Type"),
+                })
+                f.write(json_data.encode())
+
+            try:
+                upstream_response_object = CachedResponse.objects.create(
+                    request_md5=request_hash,
+                    request_ip=self.request_ip,
+                    request=self.request,
+                    response=upstream_response,
+                    response_time=response_time,
+                )
+            except Exception as error:
+                logger.exception(error)
+
+        return upstream_response
+
+    def dispatch(self, request, *args, **kwargs):
+        self.request = request
+
+        redirect_to = self.check_path_for_rewrite()
+        if redirect_to:
+            return redirect(redirect_to)
+
         try:
-            proxy_response = fetch(
-                url=request_url,
-                params=self.request.GET,
-                allow_redirects=False,
-                headers=self.upstream_request_headers,
-                data=request_payload,
-                stream=True,
-            )
-
-            content_type = None
-            if 'Content-Type' not in proxy_response.headers:
-                filename = os.path.basename(self.request.path)
-                if len(filename) > 3:
-                    logger.debug(f"Guessing mimetime from {filename}")
-                    content_type, encoding = mimetypes.guess_type(
-                        filename
-                    )
-                if not content_type:
-                    logger.debug(f"No MIME type found for {filename}, defaulting to {revproxy_app_settings.DEFAULT_CONTENT_TYPE}")
-                    content_type = revproxy_app_settings.DEFAULT_CONTENT_TYPE
-                else:
-                    logger.debug(f"Guessed content type of {content_type}")
-
-                proxy_response.headers['Content-Type'] = content_type
+            if not self.db_cache:
+                upstream_response = self.fetch_from_upstream()
+            else:
+                upstream_response = self.db_cache_proxy_response()
 
         except requests.exceptions.SSLError as error:
             logger.exception(error)
@@ -235,108 +377,14 @@ class ProxyView(View):
                 "Something went terribly wrong!"
             )
 
-        return proxy_response
-
-    def _replace_host_on_redirect_location(self, proxy_response):
-        location = proxy_response.headers.get('Location')
-        if location:
-            if self.request.is_secure():
-                scheme = 'https://'
-            else:
-                scheme = 'http://'
-            request_host = scheme + self.request.get_host()
-
-            upstream_host_https = 'https://' + self._parsed_url.netloc
-
-            location = location.replace(upstream_host_https, request_host)
-            proxy_response.headers['Location'] = location
-            logger.debug("Proxy response LOCATION: %s",
-                           proxy_response.headers['Location'])
-        return proxy_response
-
-    def dispatch(self, request, *args, **kwargs):
-        path = kwargs.get('path', request.path)
-
-        self.request = request
-
-        redirect_to = self._format_path_to_redirect()
-        if redirect_to:
-            return redirect(redirect_to)
-
-        if not self.db_cache:
-            upstream_response = self.fetch_from_proxy()
-        else:
-            extra_salt = None
-#            if self.cache_responses == 'per_ip':
-#                extra_salt = self.request_ip
-
-            request_hash = self.get_request_hash(extra_salt=extra_salt)
-
-            upstream_response_object = CachedResponse.objects.valid_cache_responses(request_hash).first()
-            if upstream_response_object:
-                logger.debug(f"💸 CACHE HIT!! {upstream_response_object}")
-                upstream_response = upstream_response_object.response
-            else:
-                logger.debug("🍟 CACHE MISS!")
-                started = timezone.now()
-
-                upstream_response = self.fetch_from_proxy()
-
-                logger.debug(upstream_response)
-
-                response_time = timezone.now() - started
-
-                try:
-                    upstream_response_object = CachedResponse.objects.create(
-                        request_md5=request_hash,
-                        request_ip=self.request_ip,
-                        request=self.request,
-                        response=upstream_response,
-                        response_time=response_time,
-                    )
-                except Exception as error:
-                    logger.exception(error)
-#                    raise
-
         response = self.modified_proxy_response(upstream_response)
         response = get_django_response(response)
+
         return response
 
     def modified_proxy_response(self, proxy_response):
         response = self._replace_host_on_redirect_location(proxy_response)
         return response
-
-    def get_request_hash(self, extra_salt=''):
-        if self.request.method == 'POST':
-            return None
-
-        body_hash = ""
-        if self.request.body:
-            body_hash = hashlib.md5(self.request.body).hexdigest()
-
-        if not extra_salt:
-            extra_salt = 'revproxy'
-
-        query_string = self.request.META.get('QUERY_STRING', "")
-        data_to_hash = [
-            self.request.method,
-            extra_salt,
-            self.request.path,
-            query_string,
-            body_hash,
-        ]
-
-        # only consider headers in self.headers_to_hash
-        for header_name in self.headers_to_hash:
-            if header_name in self.request.headers:
-                data_to_hash.append(f"{header_name}:{self.request.headers[header_name]}")
-        else:
-            logger.debug(f"Not adding any headers to request hash because {self.__class__.__name__}.headers_to_hash is empty")
-
-        d = ''.join(data_to_hash)
-        request_hash = hashlib.md5(d.encode()).hexdigest()
-        logger.debug(f"Request hash is {request_hash}")
-        return request_hash
 
     @classonlymethod
     def as_view(cls, *args, **kwargs):

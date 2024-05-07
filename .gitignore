@@ -54,3 +54,7 @@ docs/_build
 # IDEs
 .vscode/
 .idea/
+
+testproject/media
+
+testproject/db.sqlite3

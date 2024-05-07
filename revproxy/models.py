@@ -1,20 +1,68 @@
+import os
+import pprint as pp
+import hashlib
 import uuid
+from textwrap import wrap
 
+import requests
+import responses
 from django.db import models
 from django.db.models import Q
-from django.http import HttpResponse
+from django.http import HttpResponse, HttpRequest
 
 from django.conf import settings
+from requests.utils import stream_decode_response_unicode
+
 from revproxy import app_settings as revproxy_app_settings
 
 import logging
 
+
 logger = logging.getLogger(__name__)
+
+
+def response_data_directory_path(request_hash):
+    # Split up hash into directories for filesystem relief
+    # xxxxxxxx/xxxxxxxx/xxxxxxxx/xxxxxxxx
+
+    dir_name = '/'.join(
+        wrap(
+            request_hash, 8
+        ))
+
+    upload_to_dir = f"cached_responses/{dir_name}/"
+    logger.debug(f"{upload_to_dir=}")
+    return upload_to_dir
+
+
+def is_binary_content_type(content_type: str):
+    mime_type, subtype = content_type.split('/')
+
+    if mime_type == "text":
+        return False
+    if mime_type != "application":
+        return True
+    return subtype not in ["json", "ld+json", "x-httpd-php", "x-sh", "x-csh", "xhtml+xml", "xml"]
+
+
+class ChunkReader:
+
+    file = None
+
+    def __init__(self, file):
+        self.file = file
+
+    def read(self, chunk_size):
+        logger.debug(f"Reading chunk {chunk_size}")
+        return self.file.read(chunk_size)
 
 
 class CachedResponseQuerySet(models.QuerySet):
     def valid_cache_responses(self, hash):
-        return self.filter(request_md5=hash) & self.successfuls() & self.permanent_redirects()
+        return (self.filter(
+            request_md5=hash) &
+            (self.successfuls() | self.permanent_redirects())
+        )
 
     def informationals(self):
         return self.filter(
@@ -62,10 +110,27 @@ class CachedResponseQuerySet(models.QuerySet):
         )
 
 
+class StreamableResponse(responses.Response):
+
+    @property
+    def iter_content(self, chunk_size=1, decode_unicode=False):
+        """
+        Return iterator over response content.
+        """
+
+        logger.debug(f"Streamable response! {self.body}")
+
+        content = self.body.read(chunk_size)
+        if decode_unicode:
+            content = stream_decode_response_unicode(content, self)
+            content = content.decode('utf-8')
+        return content
+
+
 class CachedResponse(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     request_md5 = models.CharField(
-        max_length=128, db_index=True, editable=False
+        max_length=32, db_index=True, editable=False
     )
 
     created_at = models.DateTimeField(auto_now_add=True, db_index=True)
@@ -95,7 +160,10 @@ class CachedResponse(models.Model):
     response_content_type = models.CharField(max_length=200)
 
     response_body = models.TextField(null=True)
-    response_data = models.BinaryField(null=True)
+    response_data = models.FileField(
+        upload_to=response_data_directory_path,
+        null=True
+    )
 
     objects = CachedResponseQuerySet.as_manager()
 
@@ -107,7 +175,7 @@ class CachedResponse(models.Model):
         raise NotImplementedError()
 
     @request.setter
-    def request(self, request):
+    def request(self, request: HttpRequest):
         self.request_ip = request.META.get('REMOTE_ADDR', None)
         self.request_host = request.get_host()
         self.request_path = request.path
@@ -116,19 +184,43 @@ class CachedResponse(models.Model):
         self.request_method = request.method
 
     @property
-    def response(self):
-        return HttpResponse(
-            content=self.response_body,
-            headers=self.response_headers,
-            status=self.response_status_code,
-        )
+    def response(self) -> requests.Response:
+        r = requests.Response()
+
+        r.method = self.request_method
+        r.url = self.request_host + self.request_path
+        r.headers = self.response_headers
+        r.content_type = self.response_content_type
+        r.status_code = self.response_status_code
+#        print(dir(self.response_data.file.file))
+        r.raw = self.response_data.file
+        r.stream = True,
+#        r._contents = self.response_data
+
+        return r
 
     @response.setter
     def response(self, response_object):
         self.response_status_code = response_object.status_code
         self.response_headers = dict(response_object.headers)
         self.response_content_type = response_object.headers.get('Content-Type')
-        self.response_body = getattr(response_object, 'text', None)
-        self.response_data = getattr(response_object, 'content', None)
 
+        body_file = os.path.join(response_data_directory_path(self.request_md5), 'body')
+        self.response_data.name = body_file
+
+        if not is_binary_content_type(self.response_content_type):
+            self.response_body = response_object.text
         return
+
+    @property
+    def iter_content(self, chunk_size=1, decode_unicode=False) -> bytes:
+        """
+        Return bytes of response content.
+        """
+
+        logger.debug(f"iter_content {self.response_data.file}")
+
+        content = self.response_data.file.chunks(chunk_size)
+        if decode_unicode:
+            content = content.decode('utf-8')
+        return content

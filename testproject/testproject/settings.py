@@ -46,6 +46,7 @@ MIDDLEWARE = [
     "django.contrib.auth.middleware.AuthenticationMiddleware",
     "django.contrib.messages.middleware.MessageMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
+    "revproxy.middleware.ShortCircuitMiddleware",
 ]
 
 ROOT_URLCONF = "testproject.urls"
@@ -132,3 +133,6 @@ LOGGING = {
         "level": "DEBUG",
     },
 }
+
+MEDIA_ROOT = os.path.join(BASE_DIR, 'media/')
+MEDIA_URL = "/media/"
