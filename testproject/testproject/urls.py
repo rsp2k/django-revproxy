@@ -23,6 +23,6 @@ urlpatterns = [
     path("admin/", admin.site.urls),
     re_path(r"(?P<path>.*)$", ProxyView.as_view(
         upstream="https://demostar.io/",
-        store_in_db=True,
+        db_cache=True,
     )),
 ]

@@ -5,6 +5,8 @@ from io import StringIO
 
 import logging
 
+from django.conf import settings
+
 try:
     from django.utils.six import string_types
 except ImportError:
@@ -21,7 +23,7 @@ else:
     HAS_DIAZO = True
     from lxml import etree
 
-from .utils import get_charset, is_html_content_type
+from .utils import get_charset
 
 #: Regex used to find the doctype-header in a html content
 doctype_re = re.compile(br"^<!DOCTYPE\s[^>]+>\s*", re.MULTILINE)
@@ -29,6 +31,20 @@ doctype_re = re.compile(br"^<!DOCTYPE\s[^>]+>\s*", re.MULTILINE)
 DIAZO_OFF_REQUEST_HEADER = 'HTTP_X_DIAZO_OFF'
 #: String used to verify if request has a 'X-Diazo-Off' header
 DIAZO_OFF_RESPONSE_HEADER = 'X-Diazo-Off'
+
+
+def is_html_content_type(content_type):
+    """Function used to verify if the parameter is a proper html content type
+
+    :param content_type: String variable that represent a content-type
+    :returns:  A boolean value stating if the content_type is a valid html
+               content type
+    """
+    for html_content_type in settings.HTML_CONTENT_TYPES:
+        if content_type.startswith(html_content_type):
+            return True
+
+    return False
 
 
 def asbool(value):

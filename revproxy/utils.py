@@ -1,9 +1,11 @@
-
+import importlib
 import re
 
 import logging
+from django.conf import settings
 
 from wsgiref.util import is_hop_by_hop
+from revproxy import app_settings as revproxy_app_settings
 
 try:
     from http.cookies import SimpleCookie
@@ -12,55 +14,18 @@ except ImportError:
     from Cookie import SimpleCookie
     COOKIE_PREFIX = 'Set-Cookie: '
 
-
-#: List containing string constant that are used to represent headers that can
-#: be ignored in the required_header function
-IGNORE_HEADERS = (
-    'HTTP_ACCEPT_ENCODING',  # We want content to be uncompressed so
-                             # we remove the Accept-Encoding from
-                             # original request
-    'HTTP_HOST',
-    'HTTP_REMOTE_USER',
-)
-
-
-# Default from HTTP RFC 2616
-#   See: http://www.w3.org/Protocols/rfc2616/rfc2616-sec3.html#sec3.7.1
-#: Variable that represent the default charset used
-DEFAULT_CHARSET = 'latin-1'
-
-#: List containing string constants that represents possible html content type
-HTML_CONTENT_TYPES = (
-    'text/html',
-    'application/xhtml+xml'
-)
-
-#: Variable used to represent a minimal content size required for response
-#: to be turned into stream
-MIN_STREAMING_LENGTH = 4 * 1024  # 4KB
+logger = logging.getLogger()
 
 #: Regex used to find charset in a html content type
 _get_charset_re = re.compile(r';\s*charset=(?P<charset>[^\s;]+)', re.I)
+
 #: Regex used to clean extra HTTP prefixes in headers
 _get_header_name_re = re.compile(
     r'((http[-|_])*)(?P<header_name>(http[-|_]).*)',
     re.I,
 )
 
-
-def is_html_content_type(content_type):
-    """Function used to verify if the parameter is a proper html content type
-
-    :param content_type: String variable that represent a content-type
-    :returns:  A boolean value stating if the content_type is a valid html
-               content type
-    """
-    for html_content_type in HTML_CONTENT_TYPES:
-        if content_type.startswith(html_content_type):
-            return True
-
-    return False
-
+# sadfadsf = settings.ALLOWED_SCHEMES
 
 def should_stream(proxy_response):
     """Function to verify if the proxy_response must be converted into
@@ -72,17 +37,21 @@ def should_stream(proxy_response):
     :returns: A boolean stating if the proxy_response should
               be treated as a stream
     """
-    content_type = proxy_response.headers.get('content-type', 'application/octet-stream')
+    content_type = proxy_response.headers.get(
+        'Content-Type',
+        revproxy_app_settings.DEFAULT_CONTENT_TYPE,
+    )
 
-    if is_html_content_type(content_type):
+    if content_type in revproxy_app_settings.HTML_CONTENT_TYPES:
         return False
 
     try:
         content_length = int(proxy_response.headers.get('Content-Length', 0))
+
     except ValueError:
         content_length = 0
 
-    if not content_length or content_length > MIN_STREAMING_LENGTH:
+    if not content_length or content_length > revproxy_app_settings.MIN_STREAMING_LENGTH:
         return True
 
     return False
@@ -97,13 +66,13 @@ def get_charset(content_type):
     :returns:               A string containing the charset
     """
     if not content_type:
-        return DEFAULT_CHARSET
+        return revproxy_app_settings.DEFAULT_CHARSET
 
     matched = _get_charset_re.search(content_type)
     if matched:
         # Extract the charset and strip its double quotes
         return matched.group('charset').replace('"', '')
-    return DEFAULT_CHARSET
+    return revproxy_app_settings.DEFAULT_CHARSET
 
 
 def required_header(header):
@@ -119,7 +88,7 @@ def required_header(header):
 
     header_name_upper = header_name.upper().replace('-', '_')
 
-    if header_name_upper in IGNORE_HEADERS:
+    if header_name_upper in revproxy_app_settings.IGNORE_HEADERS:
         return False
 
     if header_name_upper.startswith('HTTP_') or header == 'CONTENT_TYPE':
@@ -128,42 +97,15 @@ def required_header(header):
     return False
 
 
-def set_response_headers(response, response_headers):
-    # check for Django 3.2 headers interface
-    # https://code.djangoproject.com/ticket/31789
-    # check and set pointer before loop to improve efficiency
-    if hasattr(response, 'headers'):
-        headers = response.headers
-    else:
-        headers = response
-
+def filter_response_headers(response, response_headers):
+    filtered_headers = {}
     for header, value in response_headers.items():
-        if is_hop_by_hop(header) or header.lower() == 'set-cookie':
-            continue
+        if not (is_hop_by_hop(header) or header.lower() == 'set-cookie'):
+            filtered_headers[header] = value
 
-        headers[header] = value
+    logger.debug(f"Modified response headers: {filtered_headers}")
 
-    if hasattr(response, 'headers'):
-        logger.debug('Response headers: %s', response.headers)
-    else:
-        logger.debug('Response headers: %s',
-                     getattr(response, '_headers', None))
-
-
-def normalize_request_headers(request):
-    r"""Function used to transform header, replacing 'HTTP\_' to ''
-    and replace '_' to '-'
-
-    :param request:  A HttpRequest that will be transformed
-    :returns:        A dictionary with the normalized headers
-    """
-    norm_headers = {}
-    for header, value in request.META.items():
-        if required_header(header):
-            norm_header = header.replace('HTTP_', '').title().replace('_', '-')
-            norm_headers[norm_header] = value
-
-    return norm_headers
+    return filtered_headers
 
 
 def encode_items(items):
@@ -180,89 +122,26 @@ def encode_items(items):
     return encoded
 
 
-logger = logging.getLogger('revproxy.cookies')
+def import_attribute(path):
+    assert isinstance(path, str)
+    pkg, attr = path.rsplit(".", 1)
+    ret = getattr(importlib.import_module(pkg), attr)
+    return ret
 
 
-def cookie_from_string(cookie_string, strict_cookies=False):
-    """Parser for HTTP header set-cookie
-    The return from this function will be used as parameters for
-    django's response.set_cookie method. Because set_cookie doesn't
-    have parameter comment, this cookie attribute will be ignored.
-
-    :param  cookie_string: A string representing a valid cookie
-    :param  strict_cookies: Whether to only accept RFC-compliant cookies
-    :returns: A dictionary containing the cookie_string attributes
-    """
-
-    if strict_cookies:
-
-        cookies = SimpleCookie(COOKIE_PREFIX + cookie_string)
-        if not cookies.keys():
-            return None
-        cookie_name, = cookies.keys()
-        cookie_dict = {k: v for k, v in cookies[cookie_name].items()
-                       if v and k != 'comment'}
-        cookie_dict['key'] = cookie_name
-        cookie_dict['value'] = cookies[cookie_name].value
-        return cookie_dict
-
+def import_callable(path_or_callable):
+    if not hasattr(path_or_callable, "__call__"):
+        ret = import_attribute(path_or_callable)
     else:
-        valid_attrs = ('path', 'domain', 'comment', 'expires',
-                       'max-age', 'httponly', 'secure', 'samesite')
-
-        cookie_dict = {}
-
-        cookie_parts = cookie_string.split(';')
-        try:
-            key, value = cookie_parts[0].split('=', 1)
-            cookie_dict['key'], cookie_dict['value'] = key, unquote(value)
-        except ValueError:
-            logger.warning('Invalid cookie: `%s`', cookie_string)
-            return None
-
-        if cookie_dict['value'].startswith('='):
-            logger.warning('Invalid cookie: `%s`', cookie_string)
-            return None
-
-        for part in cookie_parts[1:]:
-            if '=' in part:
-                attr, value = part.split('=', 1)
-                value = value.strip()
-            else:
-                attr = part
-                value = ''
-
-            attr = attr.strip().lower()
-            if not attr:
-                continue
-
-            if attr in valid_attrs:
-                if attr in ('httponly', 'secure'):
-                    cookie_dict[attr] = True
-                elif attr in 'comment':
-                    # ignoring comment attr as explained in the
-                    # function docstring
-                    continue
-                elif attr == 'max-age':
-                    # The cookie uses 'max-age' but django's
-                    # set_cookie uses 'max_age'
-                    cookie_dict['max_age'] = int(unquote(value))
-                else:
-                    cookie_dict[attr] = unquote(value)
-            else:
-                logger.warning('Unknown cookie attribute %s', attr)
-
-        return cookie_dict
+        ret = path_or_callable
+    return ret
 
 
-def unquote(value):
-    """Remove wrapping quotes from a string.
-
-    :param value: A string that might be wrapped in double quotes, such
-                  as a HTTP cookie value.
-    :returns: Beginning and ending quotes removed and escaped quotes (``\"``)
-              unescaped
-    """
-    if len(value) > 1 and value[0] == '"' and value[-1] == '"':
-        value = value[1:-1].replace(r'\"', '"')
-    return value
+def get_setting(name, dflt):
+    getter = getattr(
+        settings,
+        "REVPROXY_SETTING_GETTER",
+        lambda name, dflt: getattr(settings, name, dflt),
+    )
+    getter = import_callable(getter)
+    return getter(name, dflt)

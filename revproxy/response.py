@@ -1,15 +1,19 @@
 import logging
+import pprint as pp
 
-from .utils import cookie_from_string, should_stream, set_response_headers
+from django.conf import settings
+from revproxy import app_settings as revproxy_app_settings
+
+from .utils import should_stream
 
 from django.http import HttpResponse, StreamingHttpResponse
 
 logger = logging.getLogger('revproxy.response')
 
+from wsgiref.util import is_hop_by_hop
 
-def get_django_response(
-    proxy_response, strict_cookies=False, streaming_amount=None
-):
+
+def get_django_response(proxy_response):
     """This method is used to create an appropriate response based on the
     Content-Length of the proxy_response. If the content is bigger than
     MIN_STREAMING_LENGTH, which is found on utils.py,
@@ -18,43 +22,42 @@ def get_django_response(
 
     :param proxy_response: An Instance of urllib3.response.HTTPResponse that
                            will create an appropriate response
-    :param strict_cookies: Whether to only accept RFC-compliant cookies
-    :param streaming_amount: The amount for streaming HTTP response, if not
-                             given, use a dynamic value -- 1("no-buffering")
-                             for "text/event-stream" content type, 65535 for
-                             other types.
+
     :returns: Returns an appropriate response based on the proxy_response
               content-length
     """
     status = proxy_response.status_code
-    headers = proxy_response.headers
+    content_type = proxy_response.headers.get('Content-Type')
 
-    logger.debug('Proxy response headers: %s', headers)
-
-    content_type = headers.get('content-type', 'application/octet-stream')
-
-    logger.debug('Content-Type: %s', content_type, )
-
-    if should_stream(proxy_response) and False:
-        if streaming_amount is None:
-            amt = get_streaming_amt(proxy_response)
-        else:
-            amt = streaming_amount
+    if should_stream(proxy_response):
+        amt = get_streaming_amt(proxy_response)
 
         logger.info(('Starting streaming HTTP Response, buffering amount='
                      '"%s bytes"'), amt)
-        response = StreamingHttpResponse(proxy_response.stream(amt),
-                                         status=status,
-                                         content_type=content_type)
+        response = StreamingHttpResponse(
+            streaming_content=proxy_response.iter_content(chunk_size=amt),
+            status=status,
+            content_type=content_type,
+        )
     else:
-        response = HttpResponse(proxy_response, status=status)
+        response = HttpResponse(
+            content=proxy_response.content,
+            status=status,
+            content_type=content_type,
+        )
+
+    logger.debug(f'☢️{response = } \n {proxy_response.headers = }')
 
     logger.info('Normalizing response headers')
-    set_response_headers(response, headers)
+    for header, value in proxy_response.headers.items():
+        if not (is_hop_by_hop(header) or header.lower() == 'set-cookie'):
+            response.headers[header] = value
 
-    logger.info('Checking for invalid cookies')
+    logger.debug(f"Response Headers: {pp.pformat(response.headers)}")
+
+    logger.info('🫙 Cookies')
     for cookie in proxy_response.cookies:
-
+        logger.debug(f'🍪 {cookie = }')
         httponly = cookie.has_nonstandard_attr('httponly')
         response.set_cookie(
             cookie.name,
@@ -64,11 +67,12 @@ def get_django_response(
             secure=cookie.secure,
             expires=cookie.expires,
             httponly=httponly,
-            #            samesite=cookie.samesite,
-#            max_age=cookie.max_age,
+# Do we need to set these?
+# RFC something or other?
+#            samesite=,
+#            max_age=,
         )
-
-    logger.debug('Response cookies: %s', response.cookies)
+    logger.debug(f"{response.cookies=}")
 
     return response
 
@@ -81,16 +85,14 @@ DEFAULT_AMT = 2**16
 # buffering, all events will pending instead of return in realtime.
 NO_BUFFERING_AMT = 1
 
-NO_BUFFERING_CONTENT_TYPES = set(['text/event-stream', ])
-
 
 def get_streaming_amt(proxy_response):
     """Get the value of streaming amount(in bytes) when streaming response
 
     :param proxy_response: urllib3.response.HTTPResponse object
     """
-    content_type = proxy_response.headers.get('Content-Type', '')
-    # Disable buffering for "text/event-stream"(or other special types)
-    if content_type.lower() in NO_BUFFERING_CONTENT_TYPES:
+    content_type = proxy_response.headers.get('content-type', revproxy_app_settings.DEFAULT_CONTENT_TYPE)
+    # Disable buffering for "text/event-stream" (or other special types)
+    if content_type.lower() in revproxy_app_settings.STREAM_CONTENT_TYPES:
         return NO_BUFFERING_AMT
     return DEFAULT_AMT
