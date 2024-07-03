@@ -23,11 +23,11 @@ from revproxy.views import ProxyView
 from revproxy.middleware import short_circuit_middleware
 
 urlpatterns = [
-    path("admin/", admin.site.urls),
+    path("__admin/", admin.site.urls),
     re_path(r"(?P<path>.*)$",
         short_circuit_middleware(
             ProxyView.as_view(
-                upstream="https://demostar.io/",
+                upstream="https://ipdata.co/",
                 db_cache=True,
             )
         )

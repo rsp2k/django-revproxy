@@ -271,9 +271,7 @@ class ProxyView(View):
         logger.debug(f"Request hash is {request_hash}")
         return request_hash
 
-
-
-    def db_cache_proxy_response(self) -> requests.Response:
+    def file_cache_proxy_response(self) -> requests.Response:
         extra_salt = None
         #            if self.cache_responses == 'per_ip':
         #                extra_salt = self.request_ip
@@ -286,11 +284,12 @@ class ProxyView(View):
         if os.path.isdir(response_dir):
             logger.debug(f"💸 CACHE HIT!! {response_dir}")
 
-            body_file = os.path.join(response_dir, "body")
+            body_file = os.path.join(response_dir, "_body")
             if os.path.isfile(body_file):
-                r.raw = open(os.path.join(response_dir, "body"), "rb")
+                r.raw = open(os.path.join(response_dir, "_body"), "rb")
+                r.stream = True
 
-            request_file = os.path.join(response_dir, "request")
+            request_file = os.path.join(response_dir, "_request")
             if os.path.isfile(request_file):
                 with open(request_file, "r") as f:
                     json_data = f.read()
@@ -313,11 +312,11 @@ class ProxyView(View):
 
             os.makedirs(response_dir)
 
-            with open(os.path.join(response_dir, "body"), "wb") as f:
+            with open(os.path.join(response_dir, "_body"), "wb") as f:
                 file_iterator, response_iterator = itertools.tee(upstream_response.iter_content())
                 f.writelines(file_iterator)
 
-            with open(os.path.join(response_dir, "request"), "wb") as f:
+            with open(os.path.join(response_dir, "_request"), "wb") as f:
                 json_data = json.dumps({
                     "headers": dict(upstream_response.headers),
                     "status_code": upstream_response.status_code,
@@ -349,7 +348,7 @@ class ProxyView(View):
             if not self.db_cache:
                 upstream_response = self.fetch_from_upstream()
             else:
-                upstream_response = self.db_cache_proxy_response()
+                upstream_response = self.file_cache_proxy_response()
 
         except requests.exceptions.SSLError as error:
             logger.exception(error)

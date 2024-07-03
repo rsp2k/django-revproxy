@@ -11,6 +11,7 @@ from django.db.models import Q
 from django.http import HttpResponse, HttpRequest
 
 from django.conf import settings
+from django.utils.safestring import mark_safe
 from requests.utils import stream_decode_response_unicode
 
 from revproxy import app_settings as revproxy_app_settings
@@ -205,8 +206,19 @@ class CachedResponse(models.Model):
         self.response_headers = dict(response_object.headers)
         self.response_content_type = response_object.headers.get('Content-Type')
 
-        body_file = os.path.join(response_data_directory_path(self.request_md5), 'body')
-        self.response_data.name = body_file
+        base_path = response_data_directory_path(self.request_md5)
+        body_file = os.path.join(base_path, '_body')
+
+        filename = os.path.basename(response_object.url)
+        if '.' in filename:
+            linked_filename = os.path.join(base_path, filename)
+            os.symlink(
+                os.path.join(settings.MEDIA_ROOT, body_file),
+                os.path.join(settings.MEDIA_ROOT, linked_filename),
+            )
+            self.response_data.name = linked_filename
+        else:
+            self.response_data.name = body_file
 
         if not is_binary_content_type(self.response_content_type):
             self.response_body = response_object.text
@@ -224,3 +236,14 @@ class CachedResponse(models.Model):
         if decode_unicode:
             content = content.decode('utf-8')
         return content
+
+    def img_tag(self):
+        mime_type, mime_subtype = self.response_content_type.split('/')
+        if mime_type == 'image':
+#            if mime_subtype.startswith('svg'):
+#                return mark_safe(f"{self.response.data}")
+            return mark_safe(f'<img width="150" src="{self.response_data.url}" />')
+
+    img_tag.short_description = 'Thumbnail'
+    img_tag.allow_tags = True
+
